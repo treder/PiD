@@ -23,6 +23,7 @@ from pid._ext.imaginaire.utils.config_helper import import_all_modules_from_pack
 from pid._src.configs.common.defaults.checkpoint import register_checkpoint
 from pid._src.configs.common.defaults.ckpt_type import register_ckpt_type
 from pid._src.configs.common.defaults.conditioner_pid import register_conditioner_pid
+from pid._src.configs.common.defaults.conditioner_pid_pt import register_conditioner_pid_pt
 from pid._src.configs.common.defaults.conditioner_pixeldit import register_conditioner_pixeldit
 from pid._src.configs.common.defaults.dataloader import register_training_and_val_data
 from pid._src.configs.common.defaults.ema import register_ema
@@ -35,9 +36,11 @@ from pid._src.configs.pid_training.defaults.dataloader_pixeldit import (
     register_text_to_image_data,
     register_text_to_image_multi_resolution_data,
 )
+from pid._src.configs.pid_training.defaults.dataloader_pt import register_pt_data
 from pid._src.configs.pid_training.defaults.model_pid import (
     register_model_pid,
 )
+from pid._src.configs.pid_training.defaults.model_pid_pt import register_model_pid_pt
 from pid._src.configs.pid_training.defaults.model_pixeldit import (
     register_model_pixeldit,
     register_pixeldit_net,
@@ -108,6 +111,11 @@ def make_config() -> Config:
     register_pid_net()
     register_conditioner_pid()
 
+    # PiD path-tracing model + data + conditioner
+    register_model_pid_pt()
+    register_pt_data()
+    register_conditioner_pid_pt()
+
     # PiD training callbacks
     register_pid_training_callbacks()
 
@@ -118,5 +126,8 @@ def make_config() -> Config:
     import_all_modules_from_package("pid._src.configs.pid_training.experiment_pid_v1pt5_flux", reload=True)
     import_all_modules_from_package("pid._src.configs.pid_training.experiment_pid_v1pt5_flux2", reload=True)
     import_all_modules_from_package("pid._src.configs.pid_training.experiment_pid_v1pt5_qwenimage", reload=True)
+
+    # PiD path-tracing experiments
+    import_all_modules_from_package("pid._src.configs.pid_training.experiment_pt", reload=True)
 
     return c

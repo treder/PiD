@@ -518,3 +518,89 @@ class PidConditioner(PixelDiTConditioner):
         condition = self(data_batch, override_dropout_rate=cond_dropout_rates)
         uncondition = self(data_batch, override_dropout_rate=uncond_dropout_rates)
         return condition, uncondition
+
+
+# =============================================================================
+# PT (Path-Tracing denoising) — condition, embedder, and conditioner
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class PTCondition(BaseCondition):
+    """Condition for PidModelPT (path-tracing denoiser).
+
+    noisy_image: [B, 3, H, W] — noisy path-traced render at variable SPP.
+    buffers: [B, 13, H, W] — concatenated G-buffers (specular_albedo, diffuse_albedo,
+        normal, depth, roughness, motion vectors).
+    """
+
+    noisy_image: Optional[torch.Tensor] = None
+    buffers: Optional[torch.Tensor] = None
+
+
+class BufferTensorDrop(AbstractEmbModel):
+    """Embedder for G-buffer tensors with per-sample zero dropout.
+
+    Identical logic to LQTensorDrop but with different default keys.
+
+    Args:
+        input_key: key in data_batch containing the buffer tensor.
+        output_key: key in condition output.
+        dropout_rate: probability of zeroing out the tensor.
+    """
+
+    def __init__(
+        self,
+        input_key: str = "buffer",
+        output_key: str = "buffers",
+        dropout_rate: float = 0.0,
+    ):
+        super().__init__()
+        self._input_key = input_key
+        self._dropout_rate = dropout_rate
+        self._output_key = output_key
+
+    def forward(self, element: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return {self._output_key: element}
+
+    def random_dropout_input(
+        self, in_tensor: torch.Tensor, dropout_rate: Optional[float] = None, key: Optional[str] = None
+    ) -> torch.Tensor:
+        del key
+        dropout_rate = dropout_rate if dropout_rate is not None else self.dropout_rate
+        if dropout_rate <= 0 or in_tensor is None:
+            return in_tensor
+        batch_size = in_tensor.shape[0]
+        keep_mask = torch.bernoulli((1.0 - dropout_rate) * torch.ones(batch_size, device=in_tensor.device))
+        keep_mask_expanded = keep_mask.view(batch_size, *[1] * (in_tensor.dim() - 1)).type_as(in_tensor)
+        return keep_mask_expanded * in_tensor
+
+    def details(self) -> str:
+        return f"Output key: {self._output_key}"
+
+
+class PTConditioner(PixelDiTConditioner):
+    """Conditioner for PidModelPT (path-tracing denoiser). Returns PTCondition.
+
+    Embedders typically include:
+      - noisy_image: LQTensorDrop (input_key="noisy_image", output_key="noisy_image")
+      - buffers: BufferTensorDrop (input_key="buffer", output_key="buffers")
+    No caption embedder — text conditioning is always null.
+    """
+
+    def forward(
+        self,
+        batch: Dict,
+        override_dropout_rate: Optional[Dict[str, float]] = None,
+    ) -> PTCondition:
+        output = self._forward(batch, override_dropout_rate)
+        return PTCondition(**output)
+
+    def get_condition_uncondition(self, data_batch: Dict) -> Tuple[PTCondition, PTCondition]:
+        cond_dropout_rates = {n: 0.0 for n in self.embedders}
+        uncond_dropout_rates = {
+            n: 1.0 if e.dropout_rate > 1e-4 else 0.0 for n, e in self.embedders.items()
+        }
+        condition = self(data_batch, override_dropout_rate=cond_dropout_rates)
+        uncondition = self(data_batch, override_dropout_rate=uncond_dropout_rates)
+        return condition, uncondition
