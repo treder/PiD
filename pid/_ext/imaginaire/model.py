@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -104,6 +105,25 @@ class ImaginaireModel(torch.nn.Module):
             memory_format (torch.memory_format): Memory format of the model.
         """
         pass
+
+    @contextmanager
+    def ema_scope(self, context: str | None = None, is_cpu: bool = False):
+        """Temporarily expose EMA weights using the legacy tracker contract.
+
+        Models with a separate EMA network override this method. Trainer and
+        callbacks can therefore use one model-owned interface for both layouts.
+        """
+        del context, is_cpu
+        from pid._ext.imaginaire.utils.ema import ema_scope as legacy_ema_scope
+
+        ema_config = getattr(getattr(self, "config", None), "ema", None)
+        enabled = bool(
+            ema_config.get("enabled", False)
+            if isinstance(ema_config, dict)
+            else getattr(ema_config, "enabled", False)
+        )
+        with legacy_ema_scope(self, enabled=enabled):
+            yield None
 
     def on_before_zero_grad(
         self, optimizer: torch.optim.Optimizer, scheduler: torch.optim.lr_scheduler.LRScheduler, iteration: int

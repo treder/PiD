@@ -37,7 +37,7 @@ except ImportError:
 
 from pid._ext.imaginaire.lazy_config import LazyConfig, instantiate
 from pid._ext.imaginaire.model import ImaginaireModel
-from pid._ext.imaginaire.utils import callback, distributed, ema, log, misc
+from pid._ext.imaginaire.utils import callback, distributed, log, misc
 from pid._ext.imaginaire.utils.checkpointer import Checkpointer
 from pid._ext.imaginaire.utils.misc import StragglerDetectorV2
 
@@ -369,15 +369,37 @@ class ImaginaireTrainer:
             dataloader_val (torch.utils.data.DataLoader): The validation data loader.
             iteration (int): Current iteration number.
         """
-        self.callbacks.on_validation_start(model, dataloader_val, iteration=iteration)
+        was_training = model.training
         model.eval()
-        # Evaluate on the full validation set.
-        with ema.ema_scope(model, enabled=model.config.ema.enabled):
-            for val_iter, data_batch in enumerate(dataloader_val):
-                if self.config.trainer.max_val_iter is not None and val_iter >= self.config.trainer.max_val_iter:
-                    break
-                data_batch = misc.to(data_batch, device="cuda")
-                self.callbacks.on_validation_step_start(model, data_batch, iteration=iteration)
-                output_batch, loss = model.validation_step(data_batch, iteration)
-                self.callbacks.on_validation_step_end(model, data_batch, output_batch, loss, iteration=iteration)
-        self.callbacks.on_validation_end(model, iteration=iteration)
+        try:
+            # Isolate model-side validation randomness from the training RNG
+            # stream and seed it independently of prior training draws.
+            with misc.preserve_rng_state():
+                misc.set_random_seed(self.config.trainer.seed, by_rank=True)
+                self.callbacks.on_validation_start(model, dataloader_val, iteration=iteration)
+                try:
+                    # The model owns its EMA representation (legacy tracker or
+                    # a separate EMA network), so it also owns the swap context.
+                    with model.ema_scope("validation"):
+                        for val_iter, data_batch in enumerate(dataloader_val):
+                            if (
+                                self.config.trainer.max_val_iter is not None
+                                and val_iter >= self.config.trainer.max_val_iter
+                            ):
+                                break
+                            data_batch = misc.to(data_batch, device="cuda")
+                            self.callbacks.on_validation_step_start(model, data_batch, iteration=iteration)
+                            output_batch, loss = model.validation_step(data_batch, iteration)
+                            self.callbacks.on_validation_step_end(
+                                model,
+                                data_batch,
+                                output_batch,
+                                loss,
+                                iteration=iteration,
+                            )
+                finally:
+                    # Keep end hooks in eval mode but outside the EMA swap,
+                    # matching their weight view in the legacy lifecycle.
+                    self.callbacks.on_validation_end(model, iteration=iteration)
+        finally:
+            model.train(was_training)
