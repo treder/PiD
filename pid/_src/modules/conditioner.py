@@ -584,7 +584,7 @@ class PTConditioner(PixelDiTConditioner):
 
     Embedders typically include:
       - noisy_image: LQTensorDrop (input_key="noisy_image", output_key="noisy_image")
-      - buffers: BufferTensorDrop (input_key="buffers", output_key="buffers")
+      - g_buffers: BufferTensorDrop (input_key="buffers", output_key="buffers")
     No caption embedder — text conditioning is always null.
     """
 
