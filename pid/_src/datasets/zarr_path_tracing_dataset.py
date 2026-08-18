@@ -16,7 +16,7 @@
 """
 Zarr v3 dataset for path-tracing denoising.
 
-Reads clean converged renders and noisy renders at variable SPP from zarr v3
+Reads TAA reference renders and noisy renders at variable SPP from zarr v3
 stores, applies a consistent random crop, normalizes each buffer type, and
 returns a dict suitable for PidModelPT training.
 
@@ -28,7 +28,7 @@ Directory layout:
             {shard}/
                 1080p/
                     zarr.json          (group metadata; attributes.sequence_length)
-                    color/             (clean reference, [T, 3, H, W], float16)
+                    color/             (noisy render, [T, 3, H, W], float16)
                     color_hspp/        (half-SPP noisy render, [T, 3, H, W], float16)
                     color_1spp/        (1-SPP noisy render, optional)
                     color_4spp/        ...
@@ -40,17 +40,20 @@ Directory layout:
                     depth/             ([T, 1, H, W], float32)
                     roughness/         ([T, 1, H, W], float16)
                     mv/                ([T, 2, H, W], float32)
+                2160p_taa/
+                    zarr.json
+                    target/            (clean TAA reference, [T, 3, H, W], float16)
 """
 
 import json
 import math
 import os
-from typing import Dict, List, Optional, Sequence, Tuple
+from bisect import bisect_right
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 import torch.utils.data
-
 
 # G-buffer arrays in concat order → 3+3+3+1+1+2 = 13 channels total
 _BUFFER_KEYS: List[str] = [
@@ -64,6 +67,7 @@ _BUFFER_KEYS: List[str] = [
 
 # Known SPP keys and their SPP values (used when the dataset randomly picks SPP)
 _DEFAULT_NOISY_KEYS: Tuple[str, ...] = (
+    "color",
     "color_hspp",
     "color_1spp",
     "color_4spp",
@@ -71,6 +75,7 @@ _DEFAULT_NOISY_KEYS: Tuple[str, ...] = (
     "color_16spp",
 )
 _DEFAULT_KEY_TO_SPP: Dict[str, float] = {
+    "color": 1.0,
     "color_hspp": 0.5,
     "color_1spp": 1.0,
     "color_4spp": 4.0,
@@ -94,8 +99,13 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
         noisy_keys: Tuple of array names to consider as noisy inputs.
             At runtime only those present in the zarr group are used.
         noisy_key_to_spp: Mapping from array name to its SPP value.
-        clean_key: Array name for the clean/converged reference image.
-        crop_size: (H, W) spatial crop. Both dimensions must be divisible by 16.
+        data_group: Shard-relative Zarr group containing noisy images and buffers.
+        clean_group: Shard-relative Zarr group containing the clean reference.
+        clean_key: Array name in clean_group for the clean reference image.
+        clean_downscale_factor: Integer spatial ratio between the clean reference
+            and noisy input. The aligned clean crop is area-downsampled by this
+            factor before normalization.
+        crop_size: (H, W) input/output crop. Both dimensions must be divisible by 16.
         log1p_max_clean: HDR normalisation ceiling for clean image (log1p scale).
         log1p_max_noisy: HDR normalisation ceiling for noisy image (log1p scale).
         max_depth: Linear depth normalisation ceiling (scene units).
@@ -108,7 +118,10 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
         zarr_root: str,
         noisy_keys: Sequence[str] = _DEFAULT_NOISY_KEYS,
         noisy_key_to_spp: Dict[str, float] = _DEFAULT_KEY_TO_SPP,
-        clean_key: str = "color",
+        data_group: str = "1080p",
+        clean_group: str = "2160p_taa",
+        clean_key: str = "target",
+        clean_downscale_factor: int = 2,
         crop_size: Tuple[int, int] = (512, 512),
         log1p_max_clean: float = 10.0,
         log1p_max_noisy: float = 10.0,
@@ -118,11 +131,18 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
 
         if crop_size[0] % 16 != 0 or crop_size[1] % 16 != 0:
             raise ValueError(f"crop_size must be divisible by 16 (patch_size), got {crop_size}")
+        if clean_downscale_factor < 1:
+            raise ValueError(
+                f"clean_downscale_factor must be a positive integer, got {clean_downscale_factor}"
+            )
 
         self.zarr_root = zarr_root
         self.noisy_keys = list(noisy_keys)
         self.noisy_key_to_spp = dict(noisy_key_to_spp)
+        self.data_group = data_group
+        self.clean_group = clean_group
         self.clean_key = clean_key
+        self.clean_downscale_factor = int(clean_downscale_factor)
         self.crop_size = crop_size
         self.log1p_max_clean = log1p_max_clean
         self.log1p_max_noisy = log1p_max_noisy
@@ -130,7 +150,7 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
 
         self._index: List[Tuple[str, str, int]] = self._build_index(zarr_root)
         # Lazily populated per DataLoader worker process to avoid fork-safety issues.
-        self._group_cache: Dict[Tuple[str, str], object] = {}
+        self._group_cache: Dict[Tuple[str, str, str], object] = {}
 
         if len(self._index) == 0:
             raise RuntimeError(f"No valid zarr sequences found under {zarr_root!r}")
@@ -150,15 +170,31 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
             if not os.path.isdir(scene_dir):
                 continue
             for shard_name in sorted(os.listdir(scene_dir)):
-                meta_path = os.path.join(scene_dir, shard_name, "1080p", "zarr.json")
-                if not os.path.isfile(meta_path):
+                data_meta_path = os.path.join(scene_dir, shard_name, self.data_group, "zarr.json")
+                clean_meta_path = os.path.join(scene_dir, shard_name, self.clean_group, "zarr.json")
+                clean_array_path = os.path.join(
+                    scene_dir, shard_name, self.clean_group, self.clean_key, "zarr.json"
+                )
+                if not (
+                    os.path.isfile(data_meta_path)
+                    and os.path.isfile(clean_meta_path)
+                    and os.path.isfile(clean_array_path)
+                ):
                     continue
-                with open(meta_path) as f:
-                    meta = json.load(f)
-                seq_len = meta.get("attributes", {}).get("sequence_length")
-                if seq_len is None:
+                with open(data_meta_path) as f:
+                    data_meta = json.load(f)
+                with open(clean_meta_path) as f:
+                    clean_meta = json.load(f)
+                data_seq_len = data_meta.get("attributes", {}).get("sequence_length")
+                clean_seq_len = clean_meta.get("attributes", {}).get("sequence_length")
+                if data_seq_len is None or clean_seq_len is None:
                     continue
-                for frame_idx in range(int(seq_len)):
+                if int(data_seq_len) != int(clean_seq_len):
+                    raise ValueError(
+                        f"Sequence length mismatch for {scene_dir}/{shard_name}: "
+                        f"{self.data_group}={data_seq_len}, {self.clean_group}={clean_seq_len}"
+                    )
+                for frame_idx in range(int(data_seq_len)):
                     index.append((scene_dir, shard_name, frame_idx))
 
         return index
@@ -167,12 +203,12 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
     # Zarr group cache (lazy, per-worker)
     # =========================================================================
 
-    def _get_group(self, scene_dir: str, shard: str):
-        key = (scene_dir, shard)
+    def _get_group(self, scene_dir: str, shard: str, group_name: str):
+        key = (scene_dir, shard, group_name)
         if key not in self._group_cache:
             import zarr  # requires zarr >= 3.0
 
-            path = os.path.join(scene_dir, shard, "1080p")
+            path = os.path.join(scene_dir, shard, group_name)
             self._group_cache[key] = zarr.open_group(path, mode="r")
         return self._group_cache[key]
 
@@ -227,44 +263,87 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         scene_dir, shard, frame_idx = self._index[idx]
-        group = self._get_group(scene_dir, shard)
+        data_group = self._get_group(scene_dir, shard, self.data_group)
+        clean_group = self._get_group(scene_dir, shard, self.clean_group)
 
         crop_h, crop_w = self.crop_size
 
-        # Determine image dimensions from the clean array shape
-        arr_shape = group[self.clean_key].shape  # [T, C, H, W]
-        full_h, full_w = arr_shape[2], arr_shape[3]
+        # Pick a noisy render and ensure the input and reference grids align.
+        available_noisy = [key for key in self.noisy_keys if key in data_group]
+        if not available_noisy:
+            raise RuntimeError(
+                f"None of the requested noisy keys {self.noisy_keys} found in "
+                f"{scene_dir}/{shard}/{self.data_group}"
+            )
+        noisy_key = available_noisy[np.random.randint(0, len(available_noisy))]
+        spp_value = float(self.noisy_key_to_spp.get(noisy_key, 1.0))
+
+        clean_shape = clean_group[self.clean_key].shape
+        noisy_shape = data_group[noisy_key].shape
+        scale = self.clean_downscale_factor
+        expected_clean_shape = (
+            noisy_shape[0],
+            noisy_shape[1],
+            noisy_shape[2] * scale,
+            noisy_shape[3] * scale,
+        )
+        if clean_shape != expected_clean_shape:
+            raise ValueError(
+                f"Clean/noisy shape mismatch for {scene_dir}/{shard}: "
+                f"{self.clean_group}/{self.clean_key}={clean_shape}, expected "
+                f"{expected_clean_shape} from {self.data_group}/{noisy_key}={noisy_shape} "
+                f"with clean_downscale_factor={scale}"
+            )
+        full_h, full_w = noisy_shape[2], noisy_shape[3]
+        if crop_h > full_h or crop_w > full_w:
+            raise ValueError(
+                f"crop_size {self.crop_size} exceeds image size {(full_h, full_w)} "
+                f"for {scene_dir}/{shard}"
+            )
 
         # Random crop offsets (consistent across all arrays for this sample)
         crop_y = int(np.random.randint(0, full_h - crop_h + 1))
         crop_x = int(np.random.randint(0, full_w - crop_w + 1))
 
-        def _read(key: str) -> np.ndarray:
-            """Read [frame_idx, :, crop_y:y+H, crop_x:x+W] as float32."""
+        def _read_input(key: str) -> np.ndarray:
+            """Read an input-resolution crop as float32."""
             return np.asarray(
-                group[key][frame_idx, :, crop_y : crop_y + crop_h, crop_x : crop_x + crop_w],
+                data_group[key][
+                    frame_idx,
+                    :,
+                    crop_y : crop_y + crop_h,
+                    crop_x : crop_x + crop_w,
+                ],
                 dtype=np.float32,
             )
 
-        # --- Clean image ---
-        clean_np = _read(self.clean_key)  # [3, H, W]
+        # --- Clean image: aligned high-resolution crop, then area downsample ---
+        clean_crop_h = crop_h * scale
+        clean_crop_w = crop_w * scale
+        clean_y = crop_y * scale
+        clean_x = crop_x * scale
+        clean_np = np.asarray(
+            clean_group[self.clean_key][
+                frame_idx,
+                :,
+                clean_y : clean_y + clean_crop_h,
+                clean_x : clean_x + clean_crop_w,
+            ],
+            dtype=np.float32,
+        )
+        if scale > 1:
+            channels = clean_np.shape[0]
+            clean_np = clean_np.reshape(channels, crop_h, scale, crop_w, scale).mean(
+                axis=(2, 4)
+            )
         clean_t = torch.from_numpy(self._log1p_norm(clean_np, self.log1p_max_clean))
 
-        # --- Noisy render: pick randomly among available SPP arrays ---
-        available_noisy = [k for k in self.noisy_keys if k in group]
-        if not available_noisy:
-            raise RuntimeError(
-                f"None of the requested noisy keys {self.noisy_keys} found in "
-                f"{scene_dir}/{shard}/1080p"
-            )
-        noisy_key = available_noisy[np.random.randint(0, len(available_noisy))]
-        spp_value = float(self.noisy_key_to_spp.get(noisy_key, 1.0))
-
-        noisy_np = _read(noisy_key)  # [3, H, W]
+        # --- Noisy render ---
+        noisy_np = _read_input(noisy_key)  # [3, H, W]
         noisy_t = torch.from_numpy(self._log1p_norm(noisy_np, self.log1p_max_noisy))
 
         # --- G-buffers: read and concatenate ---
-        buffer_parts = [_read(bkey) for bkey in self.BUFFER_KEYS]
+        buffer_parts = [_read_input(bkey) for bkey in self.BUFFER_KEYS]
         buf_np = np.concatenate(buffer_parts, axis=0)  # [13, H, W]
         buf_np = self._normalize_buffers(buf_np, crop_h, crop_w)
         buf_t = torch.from_numpy(buf_np)
@@ -272,7 +351,124 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
         return {
             "image": clean_t,        # [3, H, W] in [-1, 1]
             "noisy_image": noisy_t,  # [3, H, W] in [-1, 1]
-            "buffer": buf_t,         # [13, H, W] in [-1, 1]
+            "buffers": buf_t,        # [13, H, W] in [-1, 1]
             "spp": spp_value,        # float scalar — SPP of the noisy render
             "caption": "",           # placeholder; not consumed by PTConditioner
         }
+
+
+class ZarrPathTracingMixtureDataset(torch.utils.data.Dataset):
+    """Combine Zarr datasets using explicit per-epoch sampling proportions.
+
+    Sample weights are relative weights and do not need to sum to one. The
+    mixture length defaults to the sum of the enabled source lengths. Smaller
+    sources are repeated when their allocation exceeds their native length;
+    larger sources are sampled at evenly spaced indices when undersampled.
+
+    Args:
+        zarr_roots: Mapping from a short source name to either its Zarr root or
+            a mapping containing zarr_root and per-source dataset arguments.
+        sample_weights: Mapping from source name to a non-negative relative
+            sampling weight. A weight of zero disables that source.
+        epoch_size: Number of samples in one mixture epoch. By default, use the
+            sum of the enabled datasets' native lengths.
+        **dataset_kwargs: Arguments forwarded to each ZarrPathTracingDataset.
+    """
+
+    def __init__(
+        self,
+        zarr_roots: Mapping[str, Union[str, Mapping[str, Any]]],
+        sample_weights: Optional[Mapping[str, float]] = None,
+        epoch_size: Optional[int] = None,
+        **dataset_kwargs,
+    ):
+        super().__init__()
+
+        roots = dict(zarr_roots)
+        if not roots:
+            raise ValueError("zarr_roots must contain at least one source")
+
+        weights = (
+            {name: 1.0 for name in roots}
+            if sample_weights is None
+            else {name: float(weight) for name, weight in sample_weights.items()}
+        )
+        unknown_sources = set(weights) - set(roots)
+        missing_sources = set(roots) - set(weights)
+        if unknown_sources or missing_sources:
+            raise ValueError(
+                "zarr_roots and sample_weights must have identical keys; "
+                f"unknown={sorted(unknown_sources)}, missing={sorted(missing_sources)}"
+            )
+        if any(weight < 0 for weight in weights.values()):
+            raise ValueError("sample weights must be non-negative")
+
+        enabled_names = [name for name in roots if weights[name] > 0]
+        if not enabled_names:
+            raise ValueError("at least one sample weight must be greater than zero")
+
+        self.datasets = {}
+        for name in enabled_names:
+            source = roots[name]
+            if isinstance(source, str):
+                source_root = source
+                source_kwargs = {}
+            else:
+                source_kwargs = dict(source)
+                try:
+                    source_root = source_kwargs.pop("zarr_root")
+                except KeyError as error:
+                    raise ValueError(f"Source {name!r} is missing zarr_root") from error
+            source_kwargs = {**dataset_kwargs, **source_kwargs}
+            self.datasets[name] = ZarrPathTracingDataset(
+                zarr_root=source_root,
+                **source_kwargs,
+            )
+        native_size = sum(len(dataset) for dataset in self.datasets.values())
+        self.epoch_size = native_size if epoch_size is None else int(epoch_size)
+        if self.epoch_size <= 0:
+            raise ValueError(f"epoch_size must be positive, got {self.epoch_size}")
+
+        normalized_total = sum(weights[name] for name in enabled_names)
+        exact_counts = [
+            self.epoch_size * weights[name] / normalized_total for name in enabled_names
+        ]
+        sample_counts = [int(count) for count in exact_counts]
+        remainder = self.epoch_size - sum(sample_counts)
+        largest_fractions = sorted(
+            range(len(enabled_names)),
+            key=lambda index: exact_counts[index] - sample_counts[index],
+            reverse=True,
+        )
+        for index in largest_fractions[:remainder]:
+            sample_counts[index] += 1
+
+        self.source_names = enabled_names
+        self.sample_counts = dict(zip(enabled_names, sample_counts))
+        self._cumulative_counts: List[int] = []
+        running_total = 0
+        for count in sample_counts:
+            running_total += count
+            self._cumulative_counts.append(running_total)
+
+    def __len__(self) -> int:
+        return self.epoch_size
+
+    def __getitem__(self, idx: int) -> dict:
+        if idx < 0:
+            idx += self.epoch_size
+        if idx < 0 or idx >= self.epoch_size:
+            raise IndexError(idx)
+
+        source_index = bisect_right(self._cumulative_counts, idx)
+        source_name = self.source_names[source_index]
+        source_start = 0 if source_index == 0 else self._cumulative_counts[source_index - 1]
+        position_in_source = idx - source_start
+        allocation = self.sample_counts[source_name]
+        dataset = self.datasets[source_name]
+
+        if allocation <= len(dataset):
+            dataset_index = position_in_source * len(dataset) // allocation
+        else:
+            dataset_index = position_in_source % len(dataset)
+        return dataset[dataset_index]
