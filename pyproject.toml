@@ -69,6 +69,7 @@ full = [
     # Data pipeline and distributed training.
     "scipy==1.15.2",
     "webdataset==0.2.111",
+    "zarr>=3.0,<4",
     "megatron-core==0.16.1",
     # MCore imports torch.utils.cpp_extension at module import time, which in
     # turn imports setuptools even when no extension is being built.
