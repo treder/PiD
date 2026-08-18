@@ -33,7 +33,7 @@ Pid_PT_NoisyBuffers_Config = L(PTConditioner)(
         dropout_rate=0.0,
     ),
     buffers=L(BufferTensorDrop)(
-        input_key="buffer",
+        input_key="buffers",
         output_key="buffers",
         dropout_rate=0.0,
     ),

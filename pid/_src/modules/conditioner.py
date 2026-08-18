@@ -551,7 +551,7 @@ class BufferTensorDrop(AbstractEmbModel):
 
     def __init__(
         self,
-        input_key: str = "buffer",
+        input_key: str = "buffers",
         output_key: str = "buffers",
         dropout_rate: float = 0.0,
     ):
@@ -584,7 +584,7 @@ class PTConditioner(PixelDiTConditioner):
 
     Embedders typically include:
       - noisy_image: LQTensorDrop (input_key="noisy_image", output_key="noisy_image")
-      - buffers: BufferTensorDrop (input_key="buffer", output_key="buffers")
+      - buffers: BufferTensorDrop (input_key="buffers", output_key="buffers")
     No caption embedder — text conditioning is always null.
     """
 

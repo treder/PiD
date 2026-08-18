@@ -18,7 +18,8 @@ PiD Path-Tracing (PT) denoising model.
 
 Conditions the diffusion model on a noisy path-traced render at variable SPP and
 G-buffer channels (specular albedo, diffuse albedo, normals, depth, roughness,
-motion vectors). No text conditioning; no VAE.
+motion vectors), and learns a clean TAA reference. The current dataset downsamples
+the aligned 2160p TAA target to the 1080p input grid. No text conditioning; no VAE.
 
 The noisy render is routed through PidNet's image branch (lq_video_or_image) and
 the G-buffers through the latent branch (lq_latent). Both branches use sr_scale=1
@@ -34,7 +35,7 @@ from __future__ import annotations
 import logging
 import math
 from contextlib import nullcontext
-from typing import Any, Optional
+from typing import Optional
 
 import attrs
 import numpy as np
@@ -45,7 +46,12 @@ from pid._ext.imaginaire.lazy_config import instantiate as lazy_instantiate
 from pid._ext.imaginaire.model import ImaginaireModel
 from pid._ext.imaginaire.utils import misc
 from pid._ext.imaginaire.utils.ema import FastEmaModelUpdater
-from pid._src.models.pid_model import PidModel, PidModelConfig
+from pid._src.models.pid_model import (
+    PidModel,
+    PidModelConfig,
+    PixelDiTSRLQLatentImageAlignConfig,
+    TrainDegradationConfig,
+)
 from pid._src.modules.conditioner import PTCondition
 from pid._src.networks.flow_matching import FlowMatchingTrainer
 
@@ -59,13 +65,18 @@ logger = logging.getLogger(__name__)
 
 @attrs.define(slots=False)
 class PidModelPTConfig(PidModelConfig):
+    # PT inputs are already degraded renders in pixel space. These SR-only
+    # pipelines are deliberately disabled, so their config fields must accept
+    # the None values used by the PT experiment config.
+    train_degradation_config: Optional[TrainDegradationConfig] = None
+    lq_latent_image_align_config: Optional[PixelDiTSRLQLatentImageAlignConfig] = None
     # Data batch key for the noisy PT render
     noisy_input_key: str = "noisy_image"
     # Data batch key for the concatenated G-buffer tensor [B, 13, H, W]
-    buffer_key: str = "buffer"
+    buffers_key: str = "buffers"
     # Number of G-buffer channels (specular_albedo=3, diffuse_albedo=3, normal=3,
     # depth=1, roughness=1, mv=2 → 13 total)
-    buffer_channels: int = 13
+    buffers_channels: int = 13
     # Maximum SPP value — maps to degrade_sigma=0 (gates fully open).
     # sigma = 1 - sqrt(spp / max_spp), matching 1/sqrt(SPP) MC noise convergence.
     max_spp: float = 16.0
@@ -231,7 +242,7 @@ class PidModelPT(PidModel):
             for key in (
                 self.config.input_data_key,
                 self.config.noisy_input_key,
-                self.config.buffer_key,
+                self.config.buffers_key,
             ):
                 if isinstance(data_batch.get(key), torch.Tensor):
                     data_batch[key] = self._broadcast_tensor_for_cp(data_batch[key])
@@ -334,7 +345,7 @@ class PidModelPT(PidModel):
 
         data_batch must contain:
           - noisy_input_key: noisy PT render [B, 3, H, W]
-          - buffer_key: G-buffers [B, 13, H, W]
+          - buffers_key: G-buffers [B, 13, H, W]
           - "spp" (optional): SPP value for degrade_sigma; defaults to max_spp (sigma=0)
           - "degrade_sigma" (optional): overrides spp-derived sigma
         """
@@ -348,7 +359,7 @@ class PidModelPT(PidModel):
         cp_group = self.get_context_parallel_group()
 
         noisy_image = data_batch[self.config.noisy_input_key].to(**self.tensor_kwargs)
-        buffers = data_batch[self.config.buffer_key].to(**self.tensor_kwargs)
+        buffers = data_batch[self.config.buffers_key].to(**self.tensor_kwargs)
 
         B = noisy_image.shape[0]
         img_h, img_w = noisy_image.shape[-2], noisy_image.shape[-1]

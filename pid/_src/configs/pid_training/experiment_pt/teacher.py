@@ -74,8 +74,8 @@ _PT_MODEL_CONFIG = dict(
     input_data_key="image",
     input_caption_key="caption",
     noisy_input_key="noisy_image",
-    buffer_key="buffer",
-    buffer_channels=13,
+    buffers_key="buffers",
+    buffers_channels=13,
     max_spp=16.0,
     # Flow matching
     shift=1.0,
@@ -102,11 +102,7 @@ _PT_MODEL_CONFIG = dict(
     # RGB alignment head disabled (not available with no-VAE path)
     lq_latent_image_align_config=None,
     # Net-level overrides (forwarded to PidNet constructor)
-    net=dict(
-        train_lq_proj_only=True,
-        lq_hidden_dim=512,
-        lq_num_res_blocks=2,
-    ),
+    net=_PT_NET_OVERRIDES,
 )
 
 # =============================================================================
@@ -116,8 +112,8 @@ _PT_MODEL_CONFIG = dict(
 PID_PT_TEACHER_512CROP_4BS: LazyDict = LazyDict(
     dict(
         defaults=[
-            {"override /data_train": "pt_zarr_4bs_512crop"},
-            {"override /data_val": "pt_zarr_2bs_512crop"},
+            {"override /data_train": "pt_zarr_gfxr_cp_4bs_512crop"},
+            {"override /data_val": "pt_zarr_gfxr_cp_2bs_512crop"},
             {"override /model": "ddp_pid_pt_teacher"},
             {"override /net": "pid_sr4x_v1pt5"},
             {"override /conditioner": "pid_pt_noisy_buffers"},
@@ -150,7 +146,7 @@ PID_PT_TEACHER_512CROP_4BS: LazyDict = LazyDict(
             replicate_ema_to_reg_in_training=False,
             load_training_state=False,
             strict_resume=False,
-            load_path=None,
+            load_path="",
         ),
         trainer=dict(
             max_iter=200_000,
