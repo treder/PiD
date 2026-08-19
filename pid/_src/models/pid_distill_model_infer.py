@@ -36,6 +36,7 @@ from torch import Tensor
 from pid._ext.imaginaire.lazy_config import instantiate as lazy_instantiate
 from pid._ext.imaginaire.utils import misc
 from pid._src.models.pixeldit_model import PixelDiTModel, PixelDiTModelConfig
+from pid._src.models.sampling import SamplingInputs, as_image_visualization
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,51 @@ class PidInferenceModel(PixelDiTModel):
             raise ValueError(
                 f"PiD inference expects LQ_latent with shape [B, C, H, W], got {tuple(data_batch['LQ_latent'].shape)}"
             )
+
+    def prepare_sampling_inputs(
+        self,
+        data_batch: dict,
+        *,
+        from_model_step: bool,
+    ) -> SamplingInputs:
+        """Preserve callback support for the inference-only PiD model."""
+        callback_batch = dict(data_batch)
+        lq_image = callback_batch.get("LQ_video_or_image")
+        if not isinstance(lq_image, torch.Tensor):
+            raise ValueError("PiD sampling requires LQ_video_or_image")
+        if from_model_step:
+            callback_batch["LQ_latent"] = (
+                self.encode_lq_latent(lq_image).contiguous().to(**self.tensor_kwargs)
+            )
+            callback_batch["degrade_sigma"] = torch.zeros(
+                callback_batch["LQ_latent"].shape[0],
+                device=callback_batch["LQ_latent"].device,
+                dtype=torch.float32,
+            )
+
+        reference_image = None
+        if isinstance(callback_batch.get(self.config.input_data_key), torch.Tensor):
+            reference_image, _, _ = self.get_data_and_condition(
+                callback_batch,
+                return_latent_state=False,
+            )
+        inference_batch = {
+            self.config.input_caption_key: callback_batch[self.config.input_caption_key],
+            "LQ_latent": callback_batch["LQ_latent"],
+            "degrade_sigma": callback_batch["degrade_sigma"],
+        }
+        self._validate_inference_data_batch(inference_batch)
+        return SamplingInputs(
+            inference_batch=inference_batch,
+            conditioning_images=(
+                as_image_visualization(
+                    lq_image,
+                    reference_image=reference_image,
+                    name="PiD LQ image",
+                ),
+            ),
+            reference_image=reference_image,
+        )
 
     def _resolve_inference_image_size(self, lq_latent: Tensor, image_size=None) -> tuple[int, int]:
         """Resolve output H/W from an override or from latent/VAE/SR scales."""

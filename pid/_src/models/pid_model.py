@@ -39,6 +39,7 @@ from pid._src.degradation import (
 )
 from pid._src.models.latent_noising import LatentNoisingConfig
 from pid._src.models.pixeldit_model import PixelDiTModel, PixelDiTModelConfig
+from pid._src.models.sampling import SamplingInputs, as_image_visualization
 
 try:
     from peft import LoraConfig, inject_adapter_in_model
@@ -796,6 +797,50 @@ class PidModel(PixelDiTModel):
 
         condition = self.conditioner(data_batch, override_dropout_rate={n: 0.0 for n in self.conditioner.embedders})
         return raw_data, x0, condition
+
+    def prepare_sampling_inputs(
+        self,
+        data_batch: dict,
+        *,
+        from_model_step: bool,
+    ) -> SamplingInputs:
+        """Prepare clean, latent-only PiD inputs for periodic sampling.
+
+        A live model step may replace ``LQ_latent`` with a noised version.
+        Re-encoding the retained LQ pixels restores the clean inference
+        condition. Fixed batches instead keep their authored latent and sigma.
+        """
+        callback_batch = dict(data_batch)
+        if from_model_step:
+            lq_image = callback_batch.get("LQ_video_or_image")
+            if not isinstance(lq_image, torch.Tensor):
+                raise ValueError("PiD model-step sampling requires LQ_video_or_image")
+            callback_batch["LQ_latent"] = (
+                self.encode_lq_latent(lq_image).contiguous().to(**self.tensor_kwargs)
+            )
+            callback_batch["degrade_sigma"] = torch.zeros(
+                callback_batch["LQ_latent"].shape[0],
+                device=callback_batch["LQ_latent"].device,
+                dtype=torch.float32,
+            )
+
+        raw_data, _, _ = self.get_data_and_condition(callback_batch, return_latent_state=False)
+        conditioning_image = as_image_visualization(
+            callback_batch["LQ_video_or_image"],
+            reference_image=raw_data,
+            name="PiD LQ image",
+        )
+        inference_batch = {
+            self.config.input_caption_key: callback_batch[self.config.input_caption_key],
+            "LQ_latent": callback_batch["LQ_latent"],
+            "degrade_sigma": callback_batch["degrade_sigma"],
+        }
+        self._validate_inference_data_batch(inference_batch)
+        return SamplingInputs(
+            inference_batch=inference_batch,
+            conditioning_images=(conditioning_image,),
+            reference_image=raw_data,
+        )
 
     # =========================================================================
     # Optimizer
