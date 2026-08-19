@@ -30,6 +30,7 @@ from pid._ext.imaginaire.model import ImaginaireModel
 from pid._ext.imaginaire.utils import misc
 from pid._ext.imaginaire.utils.ema import FastEmaModelUpdater
 from pid._src.losses.repa_loss import PixelDiTREPALoss
+from pid._src.models.sampling import SamplingInputs
 from pid._src.modules.ema import EMAConfig
 from pid._src.networks.flow_matching import FlowMatchingTrainer
 from pid._src.utils.context_parallel import broadcast as cp_broadcast
@@ -408,6 +409,25 @@ class PixelDiTModel(ImaginaireModel):
         # Callback expects [B, C, T, H, W] with T=1 for images
         raw_data = x0.unsqueeze(2)
         return raw_data, x0, self._EmptyCondition()
+
+    def prepare_sampling_inputs(
+        self,
+        data_batch: dict,
+        *,
+        from_model_step: bool,
+    ) -> SamplingInputs:
+        """Prepare a T2I batch for a periodic sampling callback.
+
+        T2I inference accepts the dataloader batch directly. Subclasses
+        override this hook when their inference schema differs.
+        """
+        del from_model_step
+        callback_batch = dict(data_batch)
+        raw_data, _, _ = self.get_data_and_condition(callback_batch, return_latent_state=False)
+        return SamplingInputs(
+            inference_batch=callback_batch,
+            reference_image=raw_data,
+        )
 
     # =========================================================================
     # Training
