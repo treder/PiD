@@ -890,7 +890,12 @@ class PidModel(PixelDiTModel):
         When loading a T2I checkpoint into SR model, LQ projection keys will
         be missing — use strict=False to ignore them. The zero-initialized LQ
         projections ensure the model starts from pretrained T2I behavior.
+
+        pretrain_copy (kwarg): when True, copy net weights into net_ema after
+        loading, if the checkpoint contains no net_ema.* keys. This ensures the
+        EMA starts from the pretrained backbone rather than random init.
         """
+        pretrain_copy = kwargs.get("pretrain_copy", True)
         # Detect format
         has_core_keys = any(k.startswith("core.") for k in state_dict)
         has_net_keys = any(k.startswith("net.") for k in state_dict)
@@ -923,6 +928,7 @@ class PidModel(PixelDiTModel):
                 self.repa_loss.load_state_dict(repa_sd, strict=False, assign=assign)
             if self.config.ema.enabled and hasattr(self, "net_ema"):
                 self.net_ema.load_state_dict(net_sd, strict=False, assign=assign)
+                logger.info("core.*-format checkpoint: loaded net_sd into both net and net_ema")
         else:
             # Our checkpoint format (net.*, net_ema.*, repa_loss.*)
             _net_sd = {
@@ -944,5 +950,10 @@ class PidModel(PixelDiTModel):
                         logger.warning(f"Missing keys in net: {other_missing}")
             if _ema_sd and self.config.ema.enabled and hasattr(self, "net_ema"):
                 self.net_ema.load_state_dict(_ema_sd, strict=False, assign=assign)
+            elif pretrain_copy and not _ema_sd and _net_sd and self.config.ema.enabled and hasattr(self, "net_ema"):
+                # No net_ema keys in the pretrained checkpoint — copy the freshly-loaded
+                # net weights into net_ema so the EMA starts from the pretrained backbone.
+                self.net_ema.load_state_dict(_net_sd, strict=False, assign=assign)
+                logger.info("pretrain_copy: copied net weights to net_ema (checkpoint had no net_ema keys)")
             if _repa_sd and self.repa_loss is not None:
                 self.repa_loss.load_state_dict(_repa_sd, strict=False, assign=assign)
