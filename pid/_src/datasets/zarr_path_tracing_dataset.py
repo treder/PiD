@@ -45,6 +45,7 @@ Directory layout:
                     target/            (clean TAA reference, [T, 3, H, W], float16)
 """
 
+import hashlib
 import json
 import math
 import os
@@ -109,6 +110,11 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
         log1p_max_clean: HDR normalisation ceiling for clean image (log1p scale).
         log1p_max_noisy: HDR normalisation ceiling for noisy image (log1p scale).
         max_depth: Linear depth normalisation ceiling (scene units).
+        split: ``"all"``, ``"train"``, or ``"val"``. Train/val partition
+            scene groups deterministically, keeping variants of one scene together.
+        validation_fraction: Fraction of scene groups assigned to ``"val"``.
+        split_seed: Stable seed for the scene-group partition.
+        random_seed: If set, SPP and crop choices are deterministic per index.
     """
 
     BUFFER_KEYS: List[str] = _BUFFER_KEYS
@@ -123,9 +129,13 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
         clean_key: str = "target",
         clean_downscale_factor: int = 2,
         crop_size: Tuple[int, int] = (512, 512),
-        log1p_max_clean: float = 10.0,
-        log1p_max_noisy: float = 10.0,
+        log1p_max_clean: float = 50.0,
+        log1p_max_noisy: float = 50.0,
         max_depth: float = 1000.0,
+        split: str = "all",
+        validation_fraction: float = 0.1,
+        split_seed: int = 0,
+        random_seed: Optional[int] = None,
     ):
         super().__init__()
 
@@ -135,6 +145,10 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
             raise ValueError(
                 f"clean_downscale_factor must be a positive integer, got {clean_downscale_factor}"
             )
+        if split not in {"all", "train", "val"}:
+            raise ValueError(f"split must be 'all', 'train', or 'val', got {split!r}")
+        if not 0.0 < validation_fraction < 1.0:
+            raise ValueError(f"validation_fraction must be in (0, 1), got {validation_fraction}")
 
         self.zarr_root = zarr_root
         self.noisy_keys = list(noisy_keys)
@@ -147,6 +161,10 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
         self.log1p_max_clean = log1p_max_clean
         self.log1p_max_noisy = log1p_max_noisy
         self.max_depth = max_depth
+        self.split = split
+        self.validation_fraction = float(validation_fraction)
+        self.split_seed = int(split_seed)
+        self.random_seed = random_seed
 
         self._index: List[Tuple[str, str, int]] = self._build_index(zarr_root)
         # Lazily populated per DataLoader worker process to avoid fork-safety issues.
@@ -159,6 +177,20 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
     # Index construction
     # =========================================================================
 
+    @staticmethod
+    def _scene_group(scene_name: str) -> str:
+        """Group capture variants from the same named scene into one split."""
+        return scene_name.split("_Data_", 1)[0]
+
+    def _include_scene(self, scene_name: str) -> bool:
+        if self.split == "all":
+            return True
+        group = self._scene_group(scene_name)
+        digest = hashlib.sha256(f"{self.split_seed}:{group}".encode()).digest()
+        score = int.from_bytes(digest[:8], byteorder="big") / 2**64
+        is_validation = score < self.validation_fraction
+        return is_validation if self.split == "val" else not is_validation
+
     def _build_index(self, zarr_root: str) -> List[Tuple[str, str, int]]:
         """Walk zarr_root → scenes → shards, build list of (scene_dir, shard, frame_idx)."""
         index = []
@@ -167,7 +199,7 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
 
         for scene_name in sorted(os.listdir(zarr_root)):
             scene_dir = os.path.join(zarr_root, scene_name)
-            if not os.path.isdir(scene_dir):
+            if not os.path.isdir(scene_dir) or not self._include_scene(scene_name):
                 continue
             for shard_name in sorted(os.listdir(scene_dir)):
                 data_meta_path = os.path.join(scene_dir, shard_name, self.data_group, "zarr.json")
@@ -268,6 +300,12 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
 
         crop_h, crop_w = self.crop_size
 
+        if self.random_seed is None:
+            randint = np.random.randint
+        else:
+            rng = np.random.default_rng(self.random_seed + int(idx))
+            randint = rng.integers
+
         # Pick a noisy render and ensure the input and reference grids align.
         available_noisy = [key for key in self.noisy_keys if key in data_group]
         if not available_noisy:
@@ -275,7 +313,7 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
                 f"None of the requested noisy keys {self.noisy_keys} found in "
                 f"{scene_dir}/{shard}/{self.data_group}"
             )
-        noisy_key = available_noisy[np.random.randint(0, len(available_noisy))]
+        noisy_key = available_noisy[randint(0, len(available_noisy))]
         spp_value = float(self.noisy_key_to_spp.get(noisy_key, 1.0))
 
         clean_shape = clean_group[self.clean_key].shape
@@ -302,8 +340,8 @@ class ZarrPathTracingDataset(torch.utils.data.Dataset):
             )
 
         # Random crop offsets (consistent across all arrays for this sample)
-        crop_y = int(np.random.randint(0, full_h - crop_h + 1))
-        crop_x = int(np.random.randint(0, full_w - crop_w + 1))
+        crop_y = int(randint(0, full_h - crop_h + 1))
+        crop_x = int(randint(0, full_w - crop_w + 1))
 
         def _read_input(key: str) -> np.ndarray:
             """Read an input-resolution crop as float32."""
