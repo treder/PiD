@@ -19,7 +19,8 @@
 Takes LQ VAE latent [B, z_dim, zH, zW], projects them to patch-aligned tokens
 for injection into the PixDiT_T2I transformer.
 
-Supports two gate types for ControlNet-style injection:
+Supports three gate types for ControlNet-style injection:
+  "fixed":                         x + lq  (always open, no sigma dependency)
   "sigma_aware_per_token":         x + sigmoid(Linear([x, lq]) - exp(log_alpha)*sigma) * lq  (B,N,1)
   "sigma_aware_per_token_per_dim": x + sigmoid(Linear([x, lq]) - exp(log_alpha)*sigma) * lq  (B,N,D)
 """
@@ -102,6 +103,17 @@ class SigmaAwarePerTokenAndDimGate(nn.Module):
         return x + self.compute_gate_scalar(x, lq, sigma) * lq
 
 
+class FixedGate(nn.Module):
+    """Always-open gate: x + lq (no learned gating, no sigma dependency).
+
+    Use for tasks where the conditioning should always be at full strength,
+    e.g. PT denoising where the noisy render and G-buffers are always informative.
+    """
+
+    def forward(self, x: torch.Tensor, lq: torch.Tensor, sigma: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return x + lq
+
+
 def _build_gate(gate_type: str, dim: int, zero_init: bool = True) -> nn.Module:
     # zero_init is intentionally not forwarded to gate constructors: gate zero-init is
     # redundant when output_heads is zero-init (lq=0 already kills the injection term)
@@ -110,9 +122,12 @@ def _build_gate(gate_type: str, dim: int, zero_init: bool = True) -> nn.Module:
         return SigmaAwarePerTokenGate(dim)
     elif gate_type == "sigma_aware_per_token_per_dim":
         return SigmaAwarePerTokenAndDimGate(dim)
+    elif gate_type == "fixed":
+        return FixedGate()
     else:
         raise ValueError(
-            f"Unknown gate_type: {gate_type!r}. Must be one of 'sigma_aware_per_token', 'sigma_aware_per_token_and_dim'."
+            f"Unknown gate_type: {gate_type!r}. Must be one of "
+            "'sigma_aware_per_token', 'sigma_aware_per_token_and_dim', 'fixed'."
         )
 
 
