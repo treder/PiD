@@ -62,20 +62,33 @@ PT_ZARR_MIXTURES["mixed"] = {
     "gfxr_aw2": 0.2,
 }
 
-_BATCH_SIZES = [1, 2, 4, 8]
+_BATCH_SIZES = [1, 2, 4, 8, 16]
 _CROP_SIZES = [512, 768, 1024]
+_VALIDATION_FRACTION = 0.1
+_SPLIT_SEED = 0
 
 
-def _make_pt_loader(mixture: dict[str, float], batch_size: int, crop_size: int, num_workers: int = 4):
+def _make_pt_loader(
+    mixture: dict[str, float],
+    batch_size: int,
+    crop_size: int,
+    *,
+    split: str,
+    num_workers: int = 4,
+):
     zarr_roots = {name: PT_ZARR_SOURCES[name] for name in mixture}
     return L(get_cached_replay_dataloader)(
         dataset=L(ZarrPathTracingMixtureDataset)(
             zarr_roots=zarr_roots,
             sample_weights=mixture,
             crop_size=(crop_size, crop_size),
+            split=split,
+            validation_fraction=_VALIDATION_FRACTION,
+            split_seed=_SPLIT_SEED,
+            random_seed=0 if split == "val" else None,
         ),
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=split == "train",
         num_workers=num_workers,
         pin_memory=True,
         webdataset=False,
@@ -88,21 +101,28 @@ def register_pt_data():
     for mixture_name, mixture in PT_ZARR_MIXTURES.items():
         for batch_size in _BATCH_SIZES:
             for crop_size in _CROP_SIZES:
-                node = _make_pt_loader(
+                train_node = _make_pt_loader(
                     mixture=mixture,
                     batch_size=batch_size,
                     crop_size=crop_size,
+                    split="train",
+                )
+                val_node = _make_pt_loader(
+                    mixture=mixture,
+                    batch_size=batch_size,
+                    crop_size=crop_size,
+                    split="val",
                 )
                 config_name = f"pt_zarr_{mixture_name}_{batch_size}bs_{crop_size}crop"
                 cs.store(
                     group="data_train",
                     package="dataloader_train",
                     name=config_name,
-                    node=node,
+                    node=train_node,
                 )
                 cs.store(
                     group="data_val",
                     package="dataloader_val",
                     name=config_name,
-                    node=node,
+                    node=val_node,
                 )

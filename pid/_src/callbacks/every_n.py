@@ -13,37 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import random
 from abc import abstractmethod
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from typing import Optional
 
-import numpy as np
 import torch
 
 from pid._ext.imaginaire.model import ImaginaireModel
 from pid._ext.imaginaire.trainer import ImaginaireTrainer
-from pid._ext.imaginaire.utils import distributed, log
+from pid._ext.imaginaire.utils import distributed, log, misc
 from pid._ext.imaginaire.utils.callback import Callback
-
-
-@contextmanager
-def preserve_rng_state():
-    """Keep periodic callbacks from perturbing the next training iteration."""
-    py_state = random.getstate()
-    np_state = np.random.get_state()
-    torch_cpu_state = torch.random.get_rng_state()
-    torch_cuda_states = (
-        torch.cuda.get_rng_state_all() if torch.cuda.is_available() and torch.cuda.is_initialized() else None
-    )
-    try:
-        yield
-    finally:
-        random.setstate(py_state)
-        np.random.set_state(np_state)
-        torch.random.set_rng_state(torch_cpu_state)
-        if torch_cuda_states is not None:
-            torch.cuda.set_rng_state_all(torch_cuda_states)
 
 
 class EveryN(Callback):
@@ -93,7 +72,7 @@ class EveryN(Callback):
             if should_run:
                 log.debug(f"Callback {self.__class__.__name__} fired on train_batch_end step {global_step}")
                 was_training = model.training
-                rng_context = preserve_rng_state if self.preserve_rng_state else nullcontext
+                rng_context = misc.preserve_rng_state if self.preserve_rng_state else nullcontext
                 model.eval()
                 try:
                     with rng_context():

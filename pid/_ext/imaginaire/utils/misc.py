@@ -22,7 +22,7 @@ import json
 import os
 import random
 import time
-from contextlib import ContextDecorator, nullcontext
+from contextlib import ContextDecorator, contextmanager, nullcontext
 from dataclasses import fields
 from typing import Any, Callable, List, Tuple, TypeVar, Union
 
@@ -152,6 +152,25 @@ def set_random_seed(seed: int, by_rank: bool = False) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)  # sets seed on the current CPU & all GPUs
+
+
+@contextmanager
+def preserve_rng_state():
+    """Restore Python, NumPy, CPU, and initialized CUDA RNG states on exit."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_cpu_state = torch.random.get_rng_state()
+    torch_cuda_states = (
+        torch.cuda.get_rng_state_all() if torch.cuda.is_available() and torch.cuda.is_initialized() else None
+    )
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.random.set_rng_state(torch_cpu_state)
+        if torch_cuda_states is not None:
+            torch.cuda.set_rng_state_all(torch_cuda_states)
 
 
 def arch_invariant_rand(
