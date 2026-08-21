@@ -45,12 +45,14 @@ from pid._ext.imaginaire.lazy_config import LazyDict
 #   latent branch: fold(16)           → [B, 3328, H/16, W/16]
 # =============================================================================
 
+PIXELDIT_CKPT = "checkpoints/PixelDiT_finetune_2kto4k/model_ema_bf16.pth"
+
 _PT_NET_OVERRIDES = dict(
     lq_inject_mode="controlnet",
     lq_in_channels=3,
     lq_latent_channels=13,
     lq_hidden_dim=512,
-    lq_gate_type="sigma_aware_per_token",
+    lq_gate_type="fixed",
     lq_interval=2,
     lq_num_res_blocks=2,
     lq_aux_rgb_head=False,
@@ -119,6 +121,7 @@ PID_PT_TEACHER_512CROP_4BS: LazyDict = LazyDict(
             {"override /conditioner": "pid_pt_noisy_buffers"},
             {"override /optimizer": "adamw"},
             {"override /callbacks": ["basic", "wandb"]},
+            {"override /ckpt_type": "dcp"},
             {"override /checkpoint": "local"},
             {"override /tokenizer": None},
             "_self_",
@@ -143,15 +146,17 @@ PID_PT_TEACHER_512CROP_4BS: LazyDict = LazyDict(
         ),
         checkpoint=dict(
             save_iter=2500,
-            replicate_ema_to_reg_in_training=False,
+            replicate_ema_to_reg_in_training=True,
             load_training_state=False,
             strict_resume=False,
-            load_path="",
+            load_path=PIXELDIT_CKPT,
         ),
         trainer=dict(
             max_iter=200_000,
             logging_iter=25,
-            run_validation=False,
+            run_validation=True,
+            validation_iter=2500,
+            max_val_iter=50,
             callbacks=dict(
                 grad_clip=dict(clip_norm=1.0),
                 # Visualize a training-set crop every 1000 steps
@@ -191,9 +196,22 @@ def _build_debug_run(job: LazyDict) -> dict:
             name=f"{job['job']['name']}_debug",
             wandb_mode="disabled",
         ),
+        checkpoint=dict(
+            save_iter=2500,
+            replicate_ema_to_reg_in_training=False,
+            load_training_state=False,
+            strict_resume=False,
+            load_path=PIXELDIT_CKPT,
+        ),
         trainer=dict(
             max_iter=20,
             logging_iter=2,
+            validation_iter=10,
+            max_val_iter=2,
+            callbacks=dict(
+                every_n_sample_train_infer_20step_reg=dict(every_n=10),
+                every_n_sample_train_infer_20step_ema=dict(every_n=10),
+            ),
         ),
     )
 
